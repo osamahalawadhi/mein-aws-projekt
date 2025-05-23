@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless Feedback App
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: mein-serverless-projekt-osamah
+    Description: S3 Bucket Name für die Webseite und Lambda Code
+
+Resources:
+
+  # S3 Bucket für statische Webseite
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+    DeletionPolicy: Retain
+
+  # Bucket Policy für öffentliche Lesbarkeit der Webseite
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+
+  # DynamoDB Tabelle für Feedback
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ProjektDatenOsamah
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Retain
+
+  # SNS Topic
+  FeedbackTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: MeinProjektTopicOsamah
+
+  # Lambda Rolle (für alle Lambda Funktionen)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRoleOsamah
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt FeedbackTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FeedbackTopic
+
+  # Producer Lambda Funktion
+  ProducerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProducerFunctionOsamah
+      Handler: producer.producer            # passt zu deinem Python Code
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: producer.zip
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref FeedbackTopic
+
+  # Consumer Lambda Funktion
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConsumerFunctionOsamah
+      Handler: consumer.lambda_handler      # passt zu deinem Python Code
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: consumer.zip
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FeedbackTable
+
+  # SNS Subscription Lambda (Consumer subscribed to Topic)
+  FeedbackTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FeedbackTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ConsumerFunction.Arn
+
+  # Lambda Permission für SNS Invocation (Consumer erlaubt SNS das Ausführen)
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConsumerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref FeedbackTopic
+
+  # API Gateway Rest API
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: OsamahsAPI
+
+  # API Resource /submit
+  ApiGatewayResourceSubmit:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: submit
+      RestApiId: !Ref ApiGatewayRestApi
+
+  # API POST Method /submit
+  ApiGatewayMethodSubmitPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResourceSubmit
+      RestApiId: !Ref ApiGatewayRestApi
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - Region: !Ref "AWS::Region"
+            LambdaArn: !GetAtt ProducerFunction.Arn
+
+  # API Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethodSubmitPost
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  # Lambda Permission API Gateway to invoke Producer
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProducerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/submit
+
